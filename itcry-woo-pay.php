@@ -2,20 +2,28 @@
 /**
  * Plugin Name:         ITCRY WOOPAY
  * Plugin URI:          https://itcry.com/
- * Description:         A refactored and secure payment gateway collection for WooCommerce, supporting Codepay and Easypay.
+ * Description:         A refactored and secure payment gateway collection for WooCommerce, supporting Codepay and Easypay with advanced features.
  * Author:              ITCRY
- * Version:             1.0.0
+ * Version:             1.2.0
  * Author URI:          https://itcry.com/
  * Text Domain:         itcry-woo-pay
  * Domain Path:         /languages
  * WC requires at least: 5.0
- * WC tested up to:      8.0
+ * WC tested up to:      8.9
+ * Tested up to:         6.5
  */
 
 // 防止该文件直接被访问，增强安全性
 if ( ! defined( 'ABSPATH' ) ) {
 	exit; // Exit if accessed directly.
 }
+
+// HPOS 兼容性声明
+add_action( 'before_woocommerce_init', function() {
+    if ( class_exists( \Automattic\WooCommerce\Utilities\FeaturesUtil::class ) ) {
+        \Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility( 'custom_order_tables', __FILE__, true );
+    }
+} );
 
 /**
  * 主插件类，使用单例模式确保全局只有一个实例
@@ -32,7 +40,7 @@ final class ITCRY_WOOPAY_Plugin {
      * 插件版本号
      * @var string
      */
-    public $version = '1.0.0';
+    public $version = '1.2.0';
 
     /**
      * 插件的路径和URL常量
@@ -74,6 +82,8 @@ final class ITCRY_WOOPAY_Plugin {
         // 初始化后台设置页面和通知处理器
         ITCRY_WOOPAY_Settings::get_instance();
         ITCRY_WOOPAY_Notify_Handler::get_instance();
+        // 初始化易支付接口管理器
+        ITCRY_WOOPAY_Easypay_Manager::get_instance();
     }
 
     /**
@@ -83,6 +93,9 @@ final class ITCRY_WOOPAY_Plugin {
         require_once ITCRY_WOOPAY_PATH . 'includes/class-wc-freepay-settings.php';
         require_once ITCRY_WOOPAY_PATH . 'includes/abstract-wc-freepay-gateway.php';
         require_once ITCRY_WOOPAY_PATH . 'includes/class-wc-freepay-notify-handler.php';
+        // 新增: 加载易支付接口管理器
+        require_once ITCRY_WOOPAY_PATH . 'includes/class-wc-easypay-manager.php';
+
 
         // 包含支付网关的具体实现文件
         foreach ( glob( ITCRY_WOOPAY_PATH . 'includes/gateways/*.php' ) as $gateway_file ) {
