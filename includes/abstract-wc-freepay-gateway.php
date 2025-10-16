@@ -18,65 +18,157 @@ abstract class ITCRY_WOOPAY_Abstract_Gateway extends WC_Payment_Gateway {
     protected $gateway_type;
 
     /**
+     * 交易手续费金额
+     * @var float
+     */
+    protected $fee_amount = 0;
+
+    /**
      * 构造函数
      */
     public function __construct() {
         $this->has_fields = false;
         
-        // 初始化后台设置表单字段
         $this->init_form_fields();
-
-        // 加载此网关自身的基础设置 (enabled, title, description)
         $this->init_settings();
 
-        // 定义用户在结账时看到的属性
         $this->title       = $this->get_option( 'title' );
         $this->description = $this->get_option( 'description' );
         
-        // 为后台的保存操作添加钩子
         add_action( 'woocommerce_update_options_payment_gateways_' . $this->id, array( $this, 'process_admin_options' ) );
-
-        // =================================================================
-        //
-        // 【核心修复】: 添加下面的钩子和对应的方法。
-        // 这段代码是解决“切换支付方式后客户信息丢失”问题的关键。
-        // 它能确保当用户选择此支付方式时，正确触发WooCommerce的AJAX更新，而不是刷新整个页面。
-        //
-        // =================================================================
         add_action( 'wp_enqueue_scripts', array( $this, 'payment_scripts' ) );
-    }
 
+        // 为易支付网关添加计算手续费的钩子
+        if ($this->gateway_type === 'easypay') {
+            add_action('woocommerce_cart_calculate_fees', array($this, 'add_payment_fee'));
+        }
+        
+        add_filter('woocommerce_gateway_title', array($this, 'modify_gateway_title'), 20, 2);
+    }
+    
     /**
-     * 【核心修复新增方法】: 为结账页面加载必要的内联JavaScript
-     *
-     * 这个方法确保只有在结账页面，并且当我们的支付网关被选择时，
-     *才会触发 'update_checkout' 事件，强制WooCommerce通过AJAX更新订单摘要。
-     * 这样做可以防止整个页面刷新，从而保留用户已输入的账单和送货信息。
+     * 动态修改支付网关标题以显示手续费率
      */
-    public function payment_scripts() {
-        // 仅在结账页面且未执行支付时执行
-        if ( ! is_checkout() || get_query_var( 'order-pay' ) ) {
-            return;
+    public function modify_gateway_title($title, $gateway_id) {
+        if ($this->id !== $gateway_id || $this->gateway_type !== 'easypay') {
+            return $title;
         }
 
-        // 使用wp_add_inline_script来添加一小段JS，比单独创建一个JS文件更高效
-        // 这段JS的逻辑是：当用户在支付方式中选择了我们这个插件的任何一个支付方式时
-        // 就手动触发一次 'update_checkout' 事件。
+        if ( ! is_checkout() || ! WC()->cart || WC()->cart->is_empty() ) {
+            return $title;
+        }
+        
+        // 计算基准金额
+        $base_amount = $this->get_cart_base_amount();
+
+        $manager = ITCRY_WOOPAY_Easypay_Manager::get_instance();
+        $selected_interface = $manager->select_available_interface($base_amount);
+        
+        if (!$selected_interface) return $title;
+
+        $fee_rate = $this->get_current_fee_rate($selected_interface);
+        
+        if ($fee_rate > 0) {
+            $formatted_rate = wc_format_decimal($fee_rate, 2); 
+            $fee_text = sprintf(__(' (手续费: %s%%)', 'itcry-woo-pay'), $formatted_rate);
+            $title .= $fee_text;
+        }
+
+        return $title;
+    }
+
+
+    /**
+     * 为结账页面加载必要的内联JavaScript
+     */
+    public function payment_scripts() {
+        if (!is_checkout() || get_query_var( 'order-pay' )) {
+            return;
+        }
+        
         wp_add_inline_script(
-            'wc-checkout', // 附加到WooCommerce的核心结账脚本上
+            'wc-checkout', 
             "jQuery( function( $ ) {
                 $( 'form.checkout' ).on( 'change', 'input[name=\"payment_method\"]', function() {
-                    if ( $( this ).val().startsWith( 'itcry_woo_pay_' ) ) {
-                        $( 'body' ).trigger( 'update_checkout' );
-                    }
+                    $( 'body' ).trigger( 'update_checkout' );
                 });
             });"
         );
     }
 
     /**
+     * 计算并添加支付手续费到购物车
+     */
+    public function add_payment_fee($cart) {
+        if ( is_admin() && ! defined( 'DOING_AJAX' ) ) {
+            return;
+        }
+
+        $chosen_gateway = WC()->session->get('chosen_payment_method');
+         if (isset($_POST['payment_method'])) {
+            $chosen_gateway = sanitize_text_field($_POST['payment_method']);
+        }
+        
+        if ($chosen_gateway !== $this->id) {
+            return;
+        }
+        
+        $base_amount = $this->get_cart_base_amount($cart);
+
+        $manager = ITCRY_WOOPAY_Easypay_Manager::get_instance();
+        $selected_interface = $manager->select_available_interface($base_amount);
+        
+        if (!$selected_interface) {
+            return;
+        }
+
+        $fee_rate = $this->get_current_fee_rate($selected_interface);
+
+        if ($fee_rate > 0) {
+            $this->fee_amount = round( $base_amount * ( $fee_rate / 100 ), wc_get_price_decimals() );
+            $cart->add_fee(sprintf(__('支付手续费 (%s)', 'itcry-woo-pay'), $this->get_option('title')), $this->fee_amount);
+        }
+    }
+
+    /**
+     * 【重构】获取购物车用于计算手续费的基准金额
+     * @param WC_Cart|null $cart
+     * @return float
+     */
+    protected function get_cart_base_amount($cart = null) {
+        if (null === $cart) {
+            $cart = WC()->cart;
+        }
+         // 商品总价 + 运费 + 税费
+        return $cart->get_cart_contents_total() + $cart->get_shipping_total() + $cart->get_taxes_total(false, false);
+    }
+    
+    /**
+     * 【重构】获取当前支付方式和接口的手续费率
+     * @param array $interface
+     * @return float
+     */
+    protected function get_current_fee_rate($interface) {
+        $fee_rate_key = $this->get_fee_rate_key();
+        if (empty($fee_rate_key) || !isset($interface[$fee_rate_key])) {
+            return 0.0;
+        }
+        return (float) $interface[$fee_rate_key];
+    }
+    
+    /**
+     * 根据网关ID获取费率字段名
+     */
+    private function get_fee_rate_key() {
+        if (strpos($this->id, '_zfb') !== false) return 'fee_alipay';
+        if (strpos($this->id, '_wx') !== false) return 'fee_wxpay';
+        if (strpos($this->id, '_qq') !== false) return 'fee_qqpay';
+        return '';
+    }
+
+
+    /**
      * 初始化后台设置的表单字段
-     * 这是所有子网关通用的
      */
     public function init_form_fields() {
         $this->form_fields = array(
@@ -105,9 +197,6 @@ abstract class ITCRY_WOOPAY_Abstract_Gateway extends WC_Payment_Gateway {
 
     /**
      * 处理支付的核心方法
-     *
-     * @param int $order_id
-     * @return array
      */
     public function process_payment( $order_id ) {
         $order = wc_get_order( $order_id );
@@ -116,19 +205,16 @@ abstract class ITCRY_WOOPAY_Abstract_Gateway extends WC_Payment_Gateway {
             wc_add_notice( __( '无法找到订单，支付失败。', 'itcry-woo-pay' ), 'error' );
             return array( 'result' => 'failure' );
         }
-
-        // 调用由子类实现的、用于生成支付URL的抽象方法
+        
         $redirect_url = $this->generate_payment_url( $order );
 
         if ( empty( $redirect_url ) ) {
-            wc_add_notice( __( '生成支付链接失败，请联系网站管理员。', 'itcry-woo-pay' ), 'error' );
             return array( 'result' => 'failure' );
         }
         
-        // 清空购物车
-        WC()->cart->empty_cart();
+        // 清空购物车必须在重定向 URL 成功生成后执行
+        // WC()->cart->empty_cart();
         
-        // 重定向到支付网关
         return array(
             'result'   => 'success',
             'redirect' => $redirect_url,
@@ -137,12 +223,6 @@ abstract class ITCRY_WOOPAY_Abstract_Gateway extends WC_Payment_Gateway {
 
     /**
      * 生成支付链接 (抽象方法)
-     *
-     * 这个方法必须由每一个具体的支付网关子类来实现，
-     * 因为Codepay和Easypay的链接生成逻辑不同。
-     *
-     * @param WC_Order $order
-     * @return string
      */
     protected abstract function generate_payment_url( $order );
 }
