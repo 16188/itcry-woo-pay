@@ -9,39 +9,28 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class ITCRY_WOOPAY_Notify_Handler {
 
-    /**
-     * 类的唯一实例
-     * @var ITCRY_WOOPAY_Notify_Handler
-     */
     private static $_instance = null;
 
-    /**
-     * 构造函数
-     */
     private function __construct() {
-        // 添加WooCommerce API端点，用于接收支付网关的异步通知
         add_action( 'woocommerce_api_itcry_woo_pay_codepay_notify', array( $this, 'handle_codepay_notify' ) );
         add_action( 'woocommerce_api_itcry_woo_pay_easypay_notify', array( $this, 'handle_easypay_notify' ) );
-        
-        // 添加操作以处理Codepay网关的清洁重定向
         add_action('woocommerce_api_itcry_woo_pay_codepay_return', array($this, 'handle_codepay_return_url_and_redirect'));
     }
 
-    /**
-     * 处理来自Codepay的返回。
-     * 将用户重定向到其最终的、干净的URL，以防止404错误。
-     * 如果自定义返回URL为空，则将重定向到订单接收页面。
-     */
+    public static function get_instance() {
+        if ( is_null( self::$_instance ) ) {
+            self::$_instance = new self();
+        }
+        return self::$_instance;
+    }
+
     public function handle_codepay_return_url_and_redirect() {
         $options = get_option( 'itcry_woo_pay_codepay_settings', array() );
         $final_url = '';
 
-        // 如果设置了自定义URL，请使用它。
         if ( ! empty( $options['codepay_return_url'] ) ) {
             $final_url = esc_url_raw( $options['codepay_return_url'] );
         } else {
-            // 否则，获取WooCommerce标准的订单接收URL。
-            // 对于Codepay，订单ID参数是“pay_id”。
             $order_id = isset( $_GET['pay_id'] ) ? absint( $_GET['pay_id'] ) : 0;
             if ( $order_id > 0 ) {
                 $order = wc_get_order( $order_id );
@@ -51,32 +40,16 @@ class ITCRY_WOOPAY_Notify_Handler {
             }
         }
 
-        // 如果一切都失败了，回到主页。
         if ( empty( $final_url ) ) {
             $final_url = home_url();
         }
 
-        // 使用JavaScript进行客户端重定向，以确保浏览器地址栏中的URL是干净的。
         echo '<!DOCTYPE html><html><head><title>Redirecting...</title>';
-        echo '<script type="text/javascript">window.location.replace("' . $final_url . '");</script>';
+        echo '<script type="text/javascript">window.location.replace("' . esc_url_raw( $final_url ) . '");</script>';
         echo '</head><body><p>Payment successful, redirecting...</p></body></html>';
         exit;
     }
 
-    /**
-     * 获取单例
-     * @return ITCRY_WOOPAY_Notify_Handler
-     */
-    public static function get_instance() {
-        if ( is_null( self::$_instance ) ) {
-            self::$_instance = new self();
-        }
-        return self::$_instance;
-    }
-
-    /**
-     * 处理码支付的异步通知
-     */
     public function handle_codepay_notify() {
         $options = get_option( 'itcry_woo_pay_codepay_settings', array() );
         $key = isset( $options['codepay_key'] ) ? $options['codepay_key'] : '';
@@ -87,12 +60,10 @@ class ITCRY_WOOPAY_Notify_Handler {
         
         $params = wp_unslash( $_GET );
         
-        // 验证签名
         if ( ! $this->verify_codepay_sign( $params, $key ) ) {
             $this->log_and_die( 'Codepay sign verification failed.' );
         }
 
-        // 处理业务逻辑
         $order_id = isset( $params['pay_id'] ) ? intval( $params['pay_id'] ) : 0;
         $order = wc_get_order( $order_id );
 
@@ -100,7 +71,6 @@ class ITCRY_WOOPAY_Notify_Handler {
             $this->log_and_die( 'Order not found for ID: ' . $order_id );
         }
 
-        // 检查订单状态，防止重复处理
         if ( ! $order->has_status( 'pending' ) ) {
             echo 'success';
             exit;
@@ -110,9 +80,10 @@ class ITCRY_WOOPAY_Notify_Handler {
         $money_received = isset( $params['money'] ) ? (float) $params['money'] : 0;
         $order_total = (float) $order->get_total();
 
-        if ( ( $order_total - $money_received ) > 0.01 ) {
-             $order->add_order_note( sprintf( '支付确认失败：金额不足。订单总额: %s, 实际支付: %s。交易号: %s', $order_total, $money_received, $transaction_id ) );
-             $this->log_and_die( 'Payment amount (' . $money_received . ') is less than order total (' . $order_total . ').' );
+        // 精确金额校验
+        if ( abs($order_total - $money_received) > 0.01 ) {
+             $order->add_order_note( sprintf( '支付确认失败：金额不匹配。订单总额: %s, 实际支付: %s。交易号: %s', $order_total, $money_received, $transaction_id ) );
+             $this->log_and_die( 'Payment amount (' . $money_received . ') does not match order total (' . $order_total . ').' );
         }
 
         $order->add_order_note( sprintf('支付成功！交易号: %s', $transaction_id) );
@@ -126,19 +97,24 @@ class ITCRY_WOOPAY_Notify_Handler {
         exit;
     }
 
-    /**
-     * 处理易支付的异步通知
-     */
     public function handle_easypay_notify() {
-        $options = get_option( 'itcry_woo_pay_easypay_settings', array() );
-        $key = isset( $options['easypay_key'] ) ? $options['easypay_key'] : '';
-        
-        if ( empty( $key ) ) {
-            $this->log_and_die( 'Easypay key is not configured.' );
-        }
-
         $params = wp_unslash( $_GET );
         
+        $param_parts = isset($params['param']) ? explode('_', $params['param']) : array();
+        $interface_index = isset($param_parts[0]) && is_numeric($param_parts[0]) ? intval($param_parts[0]) : -1;
+        
+        if ($interface_index === -1) {
+            $this->log_and_die('Easypay notify error: Missing interface index.');
+        }
+
+        $settings = get_option('itcry_woo_pay_easypay_settings');
+        $interface = isset($settings['interfaces'][$interface_index]) ? $settings['interfaces'][$interface_index] : null;
+
+        if (!$interface || empty($interface['key'])) {
+            $this->log_and_die('Easypay key is not configured for interface index: ' . $interface_index);
+        }
+        $key = $interface['key'];
+
         if ( ! $this->verify_easypay_sign( $params, $key ) ) {
             $this->log_and_die( 'Easypay sign verification failed.' );
         }
@@ -158,10 +134,21 @@ class ITCRY_WOOPAY_Notify_Handler {
             echo 'success';
             exit;
         }
-
-        $transaction_id = isset( $params['trade_no'] ) ? sanitize_text_field( $params['trade_no'] ) : '';
         
-        $order->add_order_note( sprintf('支付成功！交易号: %s', $transaction_id) );
+        $transaction_id = isset( $params['trade_no'] ) ? sanitize_text_field( $params['trade_no'] ) : '';
+        $money_paid = isset($params['money']) ? (float)$params['money'] : 0.0;
+        $order_total = (float) $order->get_total();
+
+        // 新增：严格的金额校验
+        if (abs($order_total - $money_paid) > 0.01) {
+            $order->add_order_note( sprintf( '支付确认失败：金额不匹配。订单总额: %s, 实际支付: %s。交易号: %s', $order_total, $money_paid, $transaction_id ) );
+            $this->log_and_die('Payment amount (' . $money_paid . ') does not match order total (' . $order_total . ').');
+        }
+
+        // 仅在金额校验成功后才更新收款总额
+        ITCRY_WOOPAY_Easypay_Manager::get_instance()->add_to_daily_total($interface_index, $money_paid);
+
+        $order->add_order_note( sprintf('支付成功！交易号: %s (接口 #%d)', $transaction_id, $interface_index + 1) );
         $order->payment_complete( $transaction_id );
 
         if ($this->is_all_virtual($order)) {
@@ -225,6 +212,9 @@ class ITCRY_WOOPAY_Notify_Handler {
     }
 
     private function log_and_die( $message ) {
+        if (WP_DEBUG === true) {
+            error_log('ITCRY_WOOPAY Error: ' . $message);
+        }
         wp_die( 'fail', 'Notify Verification', array( 'response' => 403 ) );
     }
 }

@@ -15,7 +15,7 @@
 
 // 防止该文件直接被访问，增强安全性
 if ( ! defined( 'ABSPATH' ) ) {
-	exit; // Exit if accessed directly.
+ exit; // Exit if accessed directly.
 }
 
 // HPOS 兼容性声明

@@ -32,22 +32,60 @@ class ITCRY_WOOPAY_Gateway_Easypay_WX extends ITCRY_WOOPAY_Abstract_Gateway {
      * @return string
      */
     protected function generate_payment_url( $order ) {
-        $options = get_option( 'itcry_woo_pay_easypay_settings', array() );
+        // 【关键修复】: 不再依赖 $order->get_total()，而是自己精确计算
+        // 订单的 "子总计" + "运费" + "税费" = 无手续费的基准金额
+        $order_base_amount = $order->get_subtotal() + $order->get_shipping_total() + $order->get_total_tax();
 
-        $api_url  = isset( $options['easypay_api_url'] ) ? $options['easypay_api_url'] : '';
-        $pid      = isset( $options['easypay_id'] ) ? $options['easypay_id'] : '';
-        $key      = isset( $options['easypay_key'] ) ? $options['easypay_key'] : '';
+        $manager = ITCRY_WOOPAY_Easypay_Manager::get_instance();
+        $manager->refresh_settings();
+        // 使用基准金额来选择接口，这是最准确的
+        $selected_interface = $manager->select_available_interface( $order_base_amount );
+
+        if ( ! $selected_interface ) {
+            $order->add_order_note( __( '易支付错误：当前没有可用的支付接口或所有接口均已达到限额。', 'itcry-woo-pay' ) );
+            wc_add_notice(__( '抱歉，支付服务暂时不可用，请稍后再试或联系网站管理员。', 'itcry-woo-pay' ), 'error');
+            return '';
+        }
+
+        $api_url  = $selected_interface['url'];
+        $pid      = $selected_interface['id'];
+        $key      = $selected_interface['key'];
+        $index    = $selected_interface['index'];
 
         if ( empty( $api_url ) || empty( $pid ) || empty( $key ) ) {
-            $order->add_order_note( __( '易支付设置不完整，无法发起支付。', 'itcry-woo-pay' ) );
+            $order->add_order_note( sprintf( __( '易支付接口 #%d 配置不完整，无法发起支付。', 'itcry-woo-pay' ), $index + 1 ) );
+            wc_add_notice(__( '支付配置错误，请联系网站管理员。', 'itcry-woo-pay' ), 'error');
             return '';
+        }
+        
+        // 【关键修复】: 再次计算手续费金额，确保100%准确
+        $fee_rate = $this->get_current_fee_rate($selected_interface);
+        $fee_amount = 0;
+        if ($fee_rate > 0) {
+            $fee_amount = round($order_base_amount * ($fee_rate / 100), 2);
+        }
+
+        // 【关键修复】: 最终支付金额 = 基准金额 + 手续费
+        $final_payment_amount = $order_base_amount + $fee_amount;
+
+        // 如果计算出的最终金额与订单记录的总额差异过大，则记录一条日志，以防万一
+        if (abs($final_payment_amount - (float)$order->get_total()) > 0.01) {
+             $order->add_order_note(sprintf(
+                 '支付金额校对：插件计算总额为 %.2f，订单记录总额为 %.2f。将以插件计算总额为准发起支付。',
+                 $final_payment_amount,
+                 $order->get_total()
+             ));
         }
 
         $product_name = $this->get_product_name( $order );
         $type = 'wxpay';
 
-        // 不向Easypay发送最终URL，而是发送一个自定义API端点URL。
         $return_url = WC()->api_request_url('itcry_woo_pay_easypay_return');
+        if (strpos($return_url, '?') === false) {
+            $return_url .= '?out_trade_no=' . $order->get_id();
+        } else {
+            $return_url .= '&out_trade_no=' . $order->get_id();
+        }
 
         $params = array(
             'pid'          => (int)$pid,
@@ -56,15 +94,18 @@ class ITCRY_WOOPAY_Gateway_Easypay_WX extends ITCRY_WOOPAY_Abstract_Gateway {
             'notify_url'   => WC()->api_request_url('itcry_woo_pay_easypay_notify'),
             'return_url'   => $return_url,
             'name'         => $product_name,
-            'money'        => (float) $order->get_total(),
-            'sign_type'    => 'MD5'
+            'money'        => $final_payment_amount, // <-- 使用我们精确计算的最终金额
+            'sign_type'    => 'MD5',
+            'param'        => $index . '_' . uniqid()
         );
 
         $params['sign'] = $this->generate_easypay_sign( $params, $key );
 
         $pay_url = rtrim( $api_url, '/' ) . '/submit.php?' . http_build_query( $params );
 
-        $order->add_order_note( sprintf( __( '用户选择了 %s 发起支付。', 'itcry-woo-pay' ), $this->method_title ) );
+        $order->add_order_note( sprintf( __( '用户选择了 %s 发起支付 (使用接口 #%d)，应付金额 %.2f（含手续费 %.2f）。', 'itcry-woo-pay' ), $this->method_title, $index + 1, $final_payment_amount, $fee_amount ) );
+        
+        WC()->cart->empty_cart();
 
         return $pay_url;
     }
@@ -80,7 +121,6 @@ class ITCRY_WOOPAY_Gateway_Easypay_WX extends ITCRY_WOOPAY_Abstract_Gateway {
         if ( ! empty( $options['easypay_return_url'] ) ) {
             $final_url = esc_url_raw( $options['easypay_return_url'] );
         } else {
-            // 对于Easypay，订单ID参数是“out_trade_no”。
             $order_id = isset( $_GET['out_trade_no'] ) ? absint( $_GET['out_trade_no'] ) : 0;
             if ( $order_id > 0 ) {
                 $order = wc_get_order( $order_id );
@@ -95,7 +135,7 @@ class ITCRY_WOOPAY_Gateway_Easypay_WX extends ITCRY_WOOPAY_Abstract_Gateway {
         }
         
         echo '<!DOCTYPE html><html><head><title>Redirecting...</title>';
-        echo '<script type="text/javascript">window.location.replace("' . $final_url . '");</script>';
+        echo '<script type="text/javascript">window.location.replace("' . esc_url_raw( $final_url ) . '");</script>';
         echo '</head><body><p>Payment successful, redirecting...</p></body></html>';
         exit;
     }
