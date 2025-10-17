@@ -76,6 +76,13 @@ class ITCRY_WOOPAY_Gateway_Easypay_ZFB extends ITCRY_WOOPAY_Abstract_Gateway {
              ));
         }
 
+        // 若订单总额未包含手续费，则为订单补充一条手续费项目，确保总额一致
+        $diff = round($final_payment_amount - (float)$order->get_total(), 2);
+        if ($diff > 0.01) {
+            $this->ensure_order_fee_item($order, $diff);
+            $order->add_order_note(sprintf('为订单补充支付手续费：%.2f（通道费率 %.2f%%）。', $diff, $fee_rate));
+        }
+
         $product_name = $this->get_product_name( $order );
         $type = 'alipay';
 
