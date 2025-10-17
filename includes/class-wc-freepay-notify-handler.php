@@ -137,12 +137,45 @@ class ITCRY_WOOPAY_Notify_Handler {
         
         $transaction_id = isset( $params['trade_no'] ) ? sanitize_text_field( $params['trade_no'] ) : '';
         $money_paid = isset($params['money']) ? (float)$params['money'] : 0.0;
-        $order_total = (float) $order->get_total();
 
-        // 新增：严格的金额校验
-        if (abs($order_total - $money_paid) > 0.01) {
-            $order->add_order_note( sprintf( '支付确认失败：金额不匹配。订单总额: %s, 实际支付: %s。交易号: %s', $order_total, $money_paid, $transaction_id ) );
-            $this->log_and_die('Payment amount (' . $money_paid . ') does not match order total (' . $order_total . ').');
+        // 计算“应付金额 = 基准金额 + 手续费”，以兼容开启手续费时的回调校验
+        // 基准金额：商品小计 + 运费 + 税费（不含任何支付手续费）
+        $order_base_amount = (float)$order->get_subtotal() + (float)$order->get_shipping_total() + (float)$order->get_total_tax();
+
+        // 从请求中判断支付类型，以匹配对应的费率字段
+        $pay_type = isset($params['type']) ? sanitize_text_field($params['type']) : '';
+        $fee_rate = 0.0;
+        if (is_array($interface)) {
+            if ($pay_type === 'alipay' && isset($interface['fee_alipay'])) {
+                $fee_rate = (float)$interface['fee_alipay'];
+            } elseif ($pay_type === 'wxpay' && isset($interface['fee_wxpay'])) {
+                $fee_rate = (float)$interface['fee_wxpay'];
+            } elseif ($pay_type === 'qqpay' && isset($interface['fee_qqpay'])) {
+                $fee_rate = (float)$interface['fee_qqpay'];
+            }
+        }
+
+        // 以两位小数计算手续费与最终金额，避免浮点误差
+        $fee_amount_calc = $fee_rate > 0 ? round($order_base_amount * ($fee_rate / 100), 2) : 0.0;
+        $expected_amount = round($order_base_amount + $fee_amount_calc, 2);
+
+        // 允许 0.01 的误差容忍度（单位：元）
+        $tolerance = 0.01;
+
+        // 优先按“基准金额+手续费”比对；若未启用手续费或仍不匹配，再回退到订单总额校验
+        $order_total = (float)$order->get_total();
+        $match_expected = (abs($money_paid - $expected_amount) <= $tolerance);
+        $match_order_total = (abs($money_paid - $order_total) <= $tolerance);
+
+        if (!($match_expected || $match_order_total)) {
+            $order->add_order_note( sprintf(
+                '支付确认失败：金额不匹配。订单总额: %s, 应付(含手续费): %s, 实际支付: %s。交易号: %s',
+                wc_format_decimal($order_total, 2),
+                wc_format_decimal($expected_amount, 2),
+                wc_format_decimal($money_paid, 2),
+                $transaction_id
+            ) );
+            $this->log_and_die('Payment amount (' . $money_paid . ') mismatch. Expected with fee ' . $expected_amount . ', or order total ' . $order_total . '.');
         }
 
         // 仅在金额校验成功后才更新收款总额
