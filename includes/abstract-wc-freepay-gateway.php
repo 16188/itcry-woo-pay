@@ -166,6 +166,49 @@ abstract class ITCRY_WOOPAY_Abstract_Gateway extends WC_Payment_Gateway {
         return '';
     }
 
+    /**
+     * 确保订单中存在与当前支付方式对应的手续费项目（并计入订单总额）
+     *
+     * @param WC_Order $order
+     * @param float    $fee_amount 要添加/更新的手续费金额（正数）
+     */
+    protected function ensure_order_fee_item($order, $fee_amount) {
+        $fee_amount = round((float)$fee_amount, 2);
+        if ($fee_amount <= 0) return;
+
+        // 与购物车阶段使用的费用名称保持完全一致，避免显示不一致或重复
+        $fee_name = sprintf(__('支付手续费 (%s)', 'itcry-woo-pay'), $this->get_option('title'));
+
+        // 查找同名的 fee 项，避免重复添加
+        $existing_item = null;
+        foreach ($order->get_items('fee') as $item_id => $item) {
+            if ($item->get_name() === $fee_name) {
+                $existing_item = $item;
+                break;
+            }
+        }
+
+        if ($existing_item) {
+            $current_total = (float)$existing_item->get_total();
+            if (abs($current_total - $fee_amount) <= 0.01) {
+                return; // 无需更新
+            }
+            $existing_item->set_amount($fee_amount);
+            $existing_item->set_total($fee_amount);
+            $existing_item->save();
+        } else {
+            $fee_item = new WC_Order_Item_Fee();
+            $fee_item->set_name($fee_name);
+            $fee_item->set_amount($fee_amount);
+            $fee_item->set_total($fee_amount);
+            $order->add_item($fee_item);
+        }
+
+        // 重新计算并保存总额
+        $order->calculate_totals(true);
+        $order->save();
+    }
+
 
     /**
      * 初始化后台设置的表单字段
